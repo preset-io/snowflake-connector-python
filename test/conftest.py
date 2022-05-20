@@ -1,348 +1,144 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 #
-# Copyright (c) 2012-2019 Snowflake Computing Inc. All right reserved.
+# Copyright (c) 2012-2021 Snowflake Computing Inc. All rights reserved.
 #
+from __future__ import annotations
+
 import os
-import random
-import subprocess
-import sys
-import time
-import uuid
 from contextlib import contextmanager
-from io import open
 from logging import getLogger
+from pathlib import Path
+from typing import Generator
 
 import pytest
-from parameters import CONNECTION_PARAMETERS
 
-try:
-    from parameters import CONNECTION_PARAMETERS_S3
-except:
-    CONNECTION_PARAMETERS_S3 = {}
+from snowflake.connector import SnowflakeConnection
+from snowflake.connector.telemetry import TelemetryClient, TelemetryData
 
-try:
-    from parameters import CONNECTION_PARAMETERS_AZURE
-except:
-    CONNECTION_PARAMETERS_AZURE = {}
-
-try:
-    from parameters import CONNECTION_PARAMETERS_ADMIN
-except:
-    CONNECTION_PARAMETERS_ADMIN = {}
-
-import snowflake.connector
-from snowflake.connector.connection import DefaultConverterClass
-from snowflake.connector.compat import (UTF8, TO_UNICODE, IS_WINDOWS)
-
-logger = getLogger(__name__)
-
-if os.getenv('TRAVIS') == 'true':
-    TEST_SCHEMA = 'TRAVIS_JOB_{0}'.format(os.getenv('TRAVIS_JOB_ID'))
-elif os.getenv('APPVEYOR') == 'True':
-    TEST_SCHEMA = 'APPVEYOR_JOB_{0}'.format(os.getenv('APPVEYOR_BUILD_ID'))
-else:
-    TEST_SCHEMA = 'python_connector_tests_' + TO_UNICODE(uuid.uuid4()).replace(
-        '-', '_')
-
-DEFAULT_PARAMETERS = {
-    'account': '<account_name>',
-    'user': '<user_name>',
-    'password': '<password>',
-    'database': '<database_name>',
-    'schema': '<schema_name>',
-    'protocol': 'https',
-    'host': '<host>',
-    'port': '443',
-}
-
-IS_PUBLIC_CI = os.getenv('TRAVIS') == 'true' or os.getenv('APPVEYOR') == 'True'
+from . import (
+    CLOUD_PROVIDERS,
+    EXTERNAL_SKIP_TAGS,
+    INTERNAL_SKIP_TAGS,
+    running_on_public_ci,
+)
 
 
-def help():
-    print("""Connection parameter must be specified in parameters.py,
-    for example:
-CONNECTION_PARAMETERS = {
-    'account': 'testaccount',
-    'user': 'user1',
-    'password': 'test',
-    'database': 'testdb',
-    'schema': 'public',
-}
-""")
+class TelemetryCaptureHandler(TelemetryClient):
+    def __init__(
+        self,
+        real_telemetry: TelemetryClient,
+        propagate: bool = True,
+    ):
+        super().__init__(real_telemetry._rest)
+        self.records: list[TelemetryData] = []
+        self._real_telemetry = real_telemetry
+        self._propagate = propagate
+
+    def add_log_to_batch(self, telemetry_data):
+        self.records.append(telemetry_data)
+        if self._propagate:
+            super().add_log_to_batch(telemetry_data)
+
+    def send_batch(self):
+        self.records = []
+        if self._propagate:
+            super().send_batch()
 
 
-@pytest.fixture(scope='session')
-def db_parameters():
-    return get_db_parameters()
+class TelemetryCaptureFixture:
+    """Provides a way to capture Snowflake telemetry messages."""
+
+    @contextmanager
+    def patch_connection(
+        self,
+        con: SnowflakeConnection,
+        propagate: bool = True,
+    ) -> Generator[TelemetryCaptureHandler, None, None]:
+        original_telemetry = con._telemetry
+        new_telemetry = TelemetryCaptureHandler(
+            original_telemetry,
+            propagate,
+        )
+        con._telemetry = new_telemetry
+        try:
+            yield new_telemetry
+        finally:
+            con._telemetry = original_telemetry
 
 
-def get_db_parameters():
+@pytest.fixture(scope="session")
+def capture_sf_telemetry() -> TelemetryCaptureFixture:
+    return TelemetryCaptureFixture()
+
+
+def pytest_collection_modifyitems(items) -> None:
+    """Applies tags to tests based on folders that they are in."""
+    top_test_dir = Path(__file__).parent
+    for item in items:
+        item_path = Path(str(item.fspath)).parent
+        relative_path = item_path.relative_to(top_test_dir)
+        for part in relative_path.parts:
+            item.add_marker(part)
+            if part in ("unit", "pandas"):
+                item.add_marker("skipolddriver")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def filter_log() -> None:
+    """Sets up our SecretDetector as a logging formatter.
+
+    A workaround to use our custom Formatter in pytest based on the discussion at
+    https://github.com/pytest-dev/pytest/issues/2987
     """
-    Sets the db connection parameters
-    """
-    ret = {}
-    os.environ['TZ'] = 'UTC'
-    if not IS_WINDOWS:
-        time.tzset()
+    import logging
+    import pathlib
 
-    # testaccount connection info
-    for k, v in CONNECTION_PARAMETERS.items():
-        ret[k] = v
+    from snowflake.connector.secret_detector import SecretDetector
 
-    for k, v in DEFAULT_PARAMETERS.items():
-        if k not in ret:
-            ret[k] = v
+    if not isinstance(SecretDetector, logging.Formatter):
+        # Override it if SecretDetector is not an instance of logging.Formatter
+        class SecretDetector(logging.Formatter):
+            def format(self, record: logging.LogRecord) -> str:
+                return super().format(record)
 
-    # s3 testaccount connection info. Not available in TravisCI
-    if CONNECTION_PARAMETERS_S3:
-        for k, v in CONNECTION_PARAMETERS_S3.items():
-            ret['s3_' + k] = v
-    else:
-        for k, v in CONNECTION_PARAMETERS.items():
-            ret['s3_' + k] = v
+    log_dir = os.getenv(
+        "CLIENT_LOG_DIR_PATH_DOCKER", str(pathlib.Path(__file__).parent.absolute())
+    )
 
-    # azure testaccount connection info. Not available in TravisCI
-    if CONNECTION_PARAMETERS_AZURE:
-        for k, v in CONNECTION_PARAMETERS_AZURE.items():
-            ret['azure_' + k] = v
-    else:
-        for k, v in CONNECTION_PARAMETERS.items():
-            ret['azure_' + k] = v
-
-    # snowflake admin account. Not available in TravisCI
-    for k, v in CONNECTION_PARAMETERS_ADMIN.items():
-        ret['sf_' + k] = v
-
-    if 'host' in ret and ret['host'] == DEFAULT_PARAMETERS['host']:
-        ret['host'] = ret['account'] + '.snowflakecomputing.com'
-
-    if 'account' in ret and ret['account'] == DEFAULT_PARAMETERS['account']:
-        help()
-        sys.exit(2)
-
-    # a unique table name
-    ret['name'] = 'python_tests_' + TO_UNICODE(uuid.uuid4()).replace('-', '_')
-    ret['name_wh'] = ret['name'] + 'wh'
-
-    ret['schema'] = TEST_SCHEMA
-
-    # This reduces a chance to exposing password in test output.
-    ret['a00'] = 'dummy parameter'
-    ret['a01'] = 'dummy parameter'
-    ret['a02'] = 'dummy parameter'
-    ret['a03'] = 'dummy parameter'
-    ret['a04'] = 'dummy parameter'
-    ret['a05'] = 'dummy parameter'
-    ret['a06'] = 'dummy parameter'
-    ret['a07'] = 'dummy parameter'
-    ret['a08'] = 'dummy parameter'
-    ret['a09'] = 'dummy parameter'
-    ret['a10'] = 'dummy parameter'
-    ret['a11'] = 'dummy parameter'
-    ret['a12'] = 'dummy parameter'
-    ret['a13'] = 'dummy parameter'
-    ret['a14'] = 'dummy parameter'
-    ret['a15'] = 'dummy parameter'
-    ret['a16'] = 'dummy parameter'
-    return ret
+    _logger = getLogger("snowflake.connector")
+    original_log_level = _logger.getEffectiveLevel()
+    # Make sure that the old handlers are unaffected by the DEBUG level set for the new handler
+    for handler in _logger.handlers:
+        handler.setLevel(original_log_level)
+    _logger.setLevel(logging.DEBUG)
+    sd = logging.FileHandler(os.path.join(log_dir, "", "..", "snowflake_ssm_rt.log"))
+    sd.setLevel(logging.DEBUG)
+    sd.setFormatter(
+        SecretDetector(
+            "%(asctime)s - %(threadName)s %(filename)s:%(lineno)d - %(funcName)s() - %(levelname)s - %(message)s"
+        )
+    )
+    _logger.addHandler(sd)
 
 
-@pytest.fixture(scope='session', autouse=True)
-def init_test_schema(request, db_parameters):
-    """
-    Initializes and Deinitializes the test schema
-    This is automatically called per test session.
-    """
-    ret = db_parameters
-    with snowflake.connector.connect(
-            user=ret['user'],
-            password=ret['password'],
-            host=ret['host'],
-            port=ret['port'],
-            database=ret['database'],
-            account=ret['account'],
-            protocol=ret['protocol']
-    ) as con:
-        con.cursor().execute(
-            "CREATE SCHEMA IF NOT EXISTS {0}".format(TEST_SCHEMA))
+def pytest_runtest_setup(item) -> None:
+    """Ran before calling each test, used to decide whether a test should be skipped."""
+    test_tags = [mark.name for mark in item.iter_markers()]
 
-    if CONNECTION_PARAMETERS_S3:
-        with snowflake.connector.connect(
-                user=ret['s3_user'],
-                password=ret['s3_password'],
-                host=ret['s3_host'],
-                port=ret['s3_port'],
-                database=ret['s3_database'],
-                account=ret['s3_account'],
-                protocol=ret['s3_protocol']
-        ) as con:
-            con.cursor().execute(
-                "CREATE SCHEMA IF NOT EXISTS {0}".format(TEST_SCHEMA))
-
-    if CONNECTION_PARAMETERS_AZURE:
-        with snowflake.connector.connect(
-                user=ret['azure_user'],
-                password=ret['azure_password'],
-                host=ret['azure_host'],
-                port=ret['azure_port'],
-                database=ret['azure_database'],
-                account=ret['azure_account'],
-                protocol=ret['azure_protocol']
-        ) as con:
-            con.cursor().execute(
-                "CREATE SCHEMA IF NOT EXISTS {0}".format(TEST_SCHEMA))
-
-    def fin():
-        ret1 = db_parameters
-        with snowflake.connector.connect(
-                user=ret1['user'],
-                password=ret1['password'],
-                host=ret1['host'],
-                port=ret1['port'],
-                database=ret1['database'],
-                account=ret1['account'],
-                protocol=ret1['protocol']
-        ) as con1:
-            con1.cursor().execute(
-                "DROP SCHEMA IF EXISTS {0}".format(TEST_SCHEMA))
-        if CONNECTION_PARAMETERS_S3:
-            with snowflake.connector.connect(
-                    user=ret1['s3_user'],
-                    password=ret1['s3_password'],
-                    host=ret1['s3_host'],
-                    port=ret1['s3_port'],
-                    database=ret1['s3_database'],
-                    account=ret1['s3_account'],
-                    protocol=ret1['s3_protocol']
-            ) as con1:
-                con1.cursor().execute(
-                    "DROP SCHEMA IF EXISTS {0}".format(TEST_SCHEMA))
-
-    request.addfinalizer(fin)
-
-
-def create_connection(**kwargs):
-    """
-    Creates a connection using the parameters defined in JDBC connect string
-    """
-    ret = get_db_parameters()
-    ret.update(kwargs)
-    connection = snowflake.connector.connect(**ret)
-    return connection
-
-
-def generate_k_lines_of_n_files(tmpdir, k, n, compress=False):
-    """
-    Generates K lines of N files
-    """
-    tmp_dir = str(tmpdir.mkdir('data'))
-    for i in range(n):
-        with open(os.path.join(tmp_dir, 'file{0}'.format(i)), 'w',
-                  encoding=UTF8) as f:
-            for j in range(k):
-                num = int(random.random() * 10000.0)
-                tm = time.gmtime(
-                    int(random.random() * 30000.0) - 15000)
-                dt = time.strftime('%Y-%m-%d', tm)
-                tm = time.gmtime(
-                    int(random.random() * 30000.0) - 15000)
-                ts = time.strftime('%Y-%m-%d %H:%M:%S', tm)
-                tm = time.gmtime(
-                    int(random.random() * 30000.0) - 15000)
-                tsltz = time.strftime('%Y-%m-%d %H:%M:%S', tm)
-                tm = time.gmtime(
-                    int(random.random() * 30000.0) - 15000)
-                tsntz = time.strftime('%Y-%m-%d %H:%M:%S', tm)
-                tm = time.gmtime(
-                    int(random.random() * 30000.0) - 15000)
-                tstz = time.strftime('%Y-%m-%dT%H:%M:%S', tm) + \
-                       ('-' if random.random() < 0.5 else '+') + \
-                       "{0:02d}:{1:02d}".format(
-                           int(random.random() * 12.0),
-                           int(random.random() * 60.0))
-                pct = random.random() * 1000.0
-                ratio = u"{0:5.2f}".format(random.random() * 1000.0)
-                rec = u"{0:d},{1:s},{2:s},{3:s},{4:s},{5:s},{6:f},{7:s}".format(
-                    num, dt, ts, tsltz, tsntz, tstz,
-                    pct,
-                    ratio)
-                f.write(rec + "\n")
-        if compress:
-            if not IS_WINDOWS:
-                subprocess.Popen(
-                    ['gzip', os.path.join(tmp_dir, 'file{0}'.format(i))],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE).communicate()
-            else:
-                import gzip
-                import shutil
-                fname = os.path.join(tmp_dir, 'file{0}'.format(i))
-                with open(fname, 'rb') as f_in, \
-                        gzip.open(fname + '.gz', 'wb') as f_out:
-                    shutil.copyfileobj(f_in, f_out)
-                os.unlink(fname)
-    return tmp_dir
-
-
-@contextmanager
-def db(**kwargs):
-    if not kwargs.get(u'timezone'):
-        kwargs[u'timezone'] = u'UTC'
-    if not kwargs.get(u'converter_class'):
-        kwargs[u'converter_class'] = DefaultConverterClass()
-    cnx = create_connection(**kwargs)
-    try:
-        yield cnx
-    finally:
-        cnx.close()
-
-
-@contextmanager
-def negative_db(**kwargs):
-    if not kwargs.get(u'timezone'):
-        kwargs[u'timezone'] = u'UTC'
-    if not kwargs.get(u'converter_class'):
-        kwargs[u'converter_class'] = DefaultConverterClass()
-    cnx = create_connection(**kwargs)
-    if not IS_PUBLIC_CI:
-        cnx.cursor().execute("alter session set SUPPRESS_INCIDENT_DUMPS=true")
-    try:
-        yield cnx
-    finally:
-        cnx.close()
-
-
-@pytest.fixture()
-def conn_testaccount(request):
-    connection = create_connection()
-
-    def fin():
-        connection.close()  # close when done
-
-    request.addfinalizer(fin)
-    return connection
-
-
-@pytest.fixture()
-def conn_cnx():
-    return db
-
-
-@pytest.fixture()
-def negative_conn_cnx():
-    """
-    Use this if an incident is expected and we don't want GS to create a
-    dump file about the incident"""
-    return negative_db
-
-
-@pytest.fixture()
-def test_files():
-    return generate_k_lines_of_n_files
-
-
-def pytest_runtest_setup(item):
-    for _ in item.iter_markers(name="internal"):
-        if IS_PUBLIC_CI:
-            pytest.skip("cannot run on public CI")
+    # Get what cloud providers the test is marked for if any
+    test_supported_providers = CLOUD_PROVIDERS.intersection(test_tags)
+    # Default value means that we are probably running on a developer's machine, allow everything in this case
+    current_provider = os.getenv("cloud_provider", "dev")
+    if test_supported_providers:
+        # If test is tagged for specific cloud providers add the default cloud_provider as supported too
+        test_supported_providers.add("dev")
+        if current_provider not in test_supported_providers:
+            pytest.skip(
+                "cannot run unit test against cloud provider {}".format(
+                    current_provider
+                )
+            )
+    if EXTERNAL_SKIP_TAGS.intersection(test_tags) and running_on_public_ci():
+        pytest.skip("cannot run this test on external CI")
+    elif INTERNAL_SKIP_TAGS.intersection(test_tags) and not running_on_public_ci():
+        pytest.skip("cannot run this test on internal CI")
