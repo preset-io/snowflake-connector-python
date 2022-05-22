@@ -40,6 +40,7 @@ for flag in options_def:
 
 extensions = None
 cmd_class = {}
+long_description = "our custom snowflake connector fork because we had to pass a security audit without upgrading to sql alchemy 1.4"
 
 try:
     import numpy
